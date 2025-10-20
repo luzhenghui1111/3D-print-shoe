@@ -1,0 +1,297 @@
+# ===== Cell 1 =====
+import os, sys, numpy as np, pandas as pd, matplotlib
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, ConstantKernel, WhiteKernel
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, root_mean_squared_error
+
+from scipy.optimize import fmin_l_bfgs_b  # 自定义优化器用
+
+RANDOM_STATE = 42
+VAL_RATIO = 0.15
+EXCEL_PATH = "机器学习02.xlsx"   # ← 改成你的文件名
+SHEET_NAME = 0
+
+print("Python:", sys.version.split()[0])
+print("pandas:", pd.__version__)
+print("numpy:", np.__version__)
+print("matplotlib:", matplotlib.__version__)
+import sklearn; print("scikit-learn:", sklearn.__version__)
+
+
+
+
+
+# ===== Cell 2 =====
+assert os.path.exists(EXCEL_PATH), f"❌ 找不到文件：{EXCEL_PATH}"
+df_raw = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME)
+print("✅ 读入成功：", df_raw.shape)
+
+ALIASES = {
+    "A":["a"], "B":["b"], "C":["c","厚度"], "P":["p","porosity"],
+    "F":["f","force","载荷"], "X":["x"], "Y":["y"], "Z":["z"],
+    "Dz":["dz"], "Dx":["dx"], "Dy":["dy"]
+}
+def find_col(k):
+    if k in df_raw.columns: return k
+    for alias in ALIASES.get(k, []):
+        for c in df_raw.columns:
+            if c.lower()==alias.lower(): return c
+    return None
+
+need = ["A","B","C","P","F","X","Y","Dz","Dx","Dy"]
+opt  = ["Z"]
+col_map = {k: find_col(k) for k in need+opt}
+print("列映射：",col_map)
+
+missing=[k for k,v in col_map.items() if k in need and v is None]
+if missing: raise ValueError("缺列："+str(missing))
+
+use_cols=[v for v in col_map.values() if v is not None]
+df=df_raw[use_cols].copy()
+df.columns=[k for k,v in col_map.items() if v is not None]
+
+# 丢缺失
+df=df.dropna()
+print("清理后:",df.shape)
+if "Z" in df.columns and df["Z"].nunique()<=1:
+    df=df.drop(columns=["Z"])
+    print("已丢弃Z列(单值)")
+
+display(df.head())
+
+
+
+
+
+# ===== Cell 3 =====
+train_df,val_df=train_test_split(df,test_size=VAL_RATIO,
+                                 random_state=RANDOM_STATE,shuffle=True)
+print(f"训练集:{len(train_df)} 验证集:{len(val_df)}")
+
+def enc_angles_deg(arr):
+    rad=np.deg2rad(arr.astype(float))
+    return np.column_stack([np.sin(rad),np.cos(rad)])
+
+def make_gpr_kernel():
+    return ConstantKernel(1.0,(1e-3,1e3))*Matern(length_scale=1.0,nu=1.5)\
+         +WhiteKernel(noise_level=1e-6,noise_level_bounds=(1e-12,1e-1))
+
+# 改良优化器：L-BFGS-B
+def optimizer_lbfgsb(obj_func,theta,bounds):
+    x,f,_=fmin_l_bfgs_b(obj_func,theta,bounds=bounds,maxiter=2000)
+    return x,f
+
+
+
+
+
+# ===== Cell 4 =====
+print("Stage-1: 正在训练 P̂ 模型 (ABC→P)...")
+Xp_train=train_df[["A","B","C"]].to_numpy(float)
+yp_train=train_df[["P"]].to_numpy(float)
+
+sc_Xp=StandardScaler().fit(Xp_train)
+sc_yp=StandardScaler().fit(yp_train)
+
+gprP=GaussianProcessRegressor(
+    kernel=make_gpr_kernel(),
+    n_restarts_optimizer=5,
+    random_state=RANDOM_STATE,
+    normalize_y=False,
+    optimizer=optimizer_lbfgsb,
+    alpha=1e-10
+)
+gprP.fit(sc_Xp.transform(Xp_train),sc_yp.transform(yp_train).ravel())
+print("✅ Stage-1: 训练完成")
+
+
+
+
+
+# ===== Cell 5 =====
+print("Stage-2: 正在准备训练数据...")
+# 训练集(用真实P)
+blocks=[
+    train_df[["A","B","P","F"]].to_numpy(float),
+    enc_angles_deg(train_df["X"].to_numpy()),
+    enc_angles_deg(train_df["Y"].to_numpy())
+]
+use_Z = ("Z" in train_df.columns and train_df["Z"].nunique()>1)
+if use_Z:
+    blocks.append(enc_angles_deg(train_df["Z"].to_numpy()))
+X_train_main=np.column_stack(blocks)
+
+targets=["Dz","Dx","Dy"]
+Y_train={t:train_df[[t]].to_numpy(float) for t in targets}
+
+sc_X_main=StandardScaler().fit(X_train_main)
+gprs,sc_y={},{}
+print("Stage-2: 正在训练 GPR 模型 (Dz/Dx/Dy)...")
+for t in targets:
+    sc_y[t]=StandardScaler().fit(Y_train[t])
+    gprs[t]=GaussianProcessRegressor(
+        kernel=make_gpr_kernel(),
+        n_restarts_optimizer=3,
+        random_state=RANDOM_STATE,
+        normalize_y=False,
+        optimizer=optimizer_lbfgsb,
+        alpha=1e-10
+    )
+    gprs[t].fit(sc_X_main.transform(X_train_main),sc_y[t].transform(Y_train[t]).ravel())
+print("✅ Stage-2: 训练完成")
+
+# 验证集 (端到端: 先算P̂再入Stage-2)
+print("Stage-2: 正在生成验证集 P̂...")
+Xp_val=val_df[["A","B","C"]].to_numpy(float)
+p_mean,_=gprP.predict(sc_Xp.transform(Xp_val),return_std=True)
+p_hat_val=sc_yp.inverse_transform(p_mean.reshape(-1,1)).ravel()
+
+blocks_val=[
+    val_df[["A","B"]].to_numpy(float),
+    p_hat_val.reshape(-1,1),
+    val_df[["F"]].to_numpy(float),
+    enc_angles_deg(val_df["X"].to_numpy()),
+    enc_angles_deg(val_df["Y"].to_numpy())
+]
+if use_Z:
+    blocks_val.append(enc_angles_deg(val_df["Z"].to_numpy()))
+X_val_main=np.column_stack(blocks_val)
+X_val_main_sc=sc_X_main.transform(X_val_main)
+
+def _nice_limits(a, b, pad_ratio=0.05):
+    lo, hi = float(min(a.min(), b.min())), float(max(a.max(), b.max()))
+    pad = (hi - lo) * pad_ratio if hi > lo else 1.0
+    return lo - pad, hi + pad
+
+print("Stage-2: 正在验证 Dz/Dx/Dy...")
+for t in targets:
+    mean_sc,std_sc=gprs[t].predict(X_val_main_sc,return_std=True)
+    y_pred=sc_y[t].inverse_transform(mean_sc.reshape(-1,1)).ravel()
+    y_true=val_df[t].to_numpy(float).ravel()
+    residuals = y_true - y_pred
+
+    R2=r2_score(y_true,y_pred)
+    RMSE=root_mean_squared_error(y_true,y_pred)
+    print(f"[Validation] {t}: R²={R2:.4f}, RMSE={RMSE:.4f}")
+
+    # 残差直方图：灰色虚线边框 + 斜纹
+    plt.figure(figsize=(4.8, 3.2))
+    n, bins, patches = plt.hist(residuals, bins=30)
+    for p in patches:
+        p.set_facecolor('none')
+        p.set_edgecolor('0.4')
+        p.set_linestyle('--')
+        p.set_linewidth(1.2)
+        p.set_hatch('////')
+    plt.grid(alpha=0.25, linestyle=':', linewidth=0.8)
+    plt.title(f"Residuals {t}")
+    plt.xlabel("Residual"); plt.ylabel("Count")
+    plt.tight_layout(); plt.show()
+
+    # Parity：中空黑边小圆点
+    plt.figure(figsize=(4.3, 4.3))
+    plt.scatter(y_true, y_pred, s=26,
+                facecolors='none', edgecolors='black', linewidths=0.8)
+    lo, hi = _nice_limits(y_true, y_pred, 0.06)
+    plt.plot([lo, hi], [lo, hi], linestyle='--', color='0.4', linewidth=1.0)
+    plt.xlim(lo, hi); plt.ylim(lo, hi)
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.grid(alpha=0.25, linestyle=':', linewidth=0.8)
+    plt.title(f"Parity {t}")
+    plt.xlabel("True"); plt.ylabel("Predicted")
+    plt.text(0.02, 0.98, f"R²={R2:.3f}\nRMSE={RMSE:.3f}",
+             transform=plt.gca().transAxes, ha='left', va='top', fontsize=9,
+             bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='0.7', alpha=0.9))
+    plt.tight_layout(); plt.show()
+print("✅ Stage-2: 验证完成")
+
+
+
+
+
+# ===== Cell 6 =====
+# 连续化扩展数据集：新样本数 = 原始数据量的10倍
+N_NEW = len(df) * 10
+SAVE_PATH = "扩展数据_预测结果.xlsx"   # 想保存就留着；不保存设为 None
+
+rng = np.random.default_rng(RANDOM_STATE)
+
+# 1) 连续采样 A, B, C
+A_new = rng.uniform(1.0, 5.0, N_NEW)
+B_new = rng.uniform(1.0, 5.0, N_NEW)
+C_new = rng.uniform(1.5, 3.0, N_NEW)
+
+# 2) F、角度范围取原数据实际范围
+def _minmax(series):
+    return float(series.min()), float(series.max())
+
+F_lo, F_hi = _minmax(df["F"])
+X_lo, X_hi = _minmax(df["X"])
+Y_lo, Y_hi = _minmax(df["Y"])
+Z_used = ("Z" in df.columns and df["Z"].nunique()>1)
+if Z_used:
+    Z_lo, Z_hi = _minmax(df["Z"])
+
+F_new = rng.uniform(F_lo, F_hi, N_NEW)
+X_new = rng.uniform(X_lo, X_hi, N_NEW)
+Y_new = rng.uniform(Y_lo, Y_hi, N_NEW)
+if Z_used:
+    Z_new = rng.uniform(Z_lo, Z_hi, N_NEW)
+
+# 3) 用 Stage-1 计算 P̂(ABC)
+ABC_sc = sc_Xp.transform(np.column_stack([A_new, B_new, C_new]))
+P_hat_sc, _ = gprP.predict(ABC_sc, return_std=True)
+P_new = sc_yp.inverse_transform(P_hat_sc.reshape(-1,1)).ravel()
+
+# 4) 组装 Stage-2 的输入并预测 Dz/Dx/Dy
+blocks_new = [
+    np.column_stack([A_new, B_new, P_new, F_new]),
+    enc_angles_deg(X_new),
+    enc_angles_deg(Y_new),
+]
+if Z_used:
+    blocks_new.append(enc_angles_deg(Z_new))
+X_new_main = np.column_stack(blocks_new)
+X_new_sc = sc_X_main.transform(X_new_main)
+
+preds = {}
+for t in ["Dz","Dx","Dy"]:
+    mean_sc,_ = gprs[t].predict(X_new_sc, return_std=True)
+    preds[t] = sc_y[t].inverse_transform(mean_sc.reshape(-1,1)).ravel()
+
+# 5) 汇成 DataFrame（扩展数据）
+cols = {
+    "A":A_new, "B":B_new, "C":C_new, "P_hat":P_new,
+    "F":F_new, "X":X_new, "Y":Y_new
+}
+if Z_used: cols["Z"] = Z_new
+for t in ["Dz","Dx","Dy"]:
+    cols[t+"_pred"] = preds[t]
+
+new_df = pd.DataFrame(cols)
+new_df["来源"] = "Extended"   # 标记来源
+print("✅ 连续化扩展数据构建完成：", new_df.shape)
+display(new_df.head())
+
+# 6) 拼接原始数据 + 扩展数据
+df_for_concat = df.copy()
+df_for_concat = df_for_concat.rename(columns={"P":"P_hat"})
+for t in ["Dz","Dx","Dy"]:
+    if t in df_for_concat.columns:
+        df_for_concat = df_for_concat.rename(columns={t:t+"_pred"})
+df_for_concat["来源"] = "Original"
+
+all_df = pd.concat([df_for_concat, new_df], ignore_index=True)
+print("📦 拼接后的完整数据：", all_df.shape)
+display(all_df.head())
+
+# 7) 保存到 Excel
+if SAVE_PATH:
+    with pd.ExcelWriter(SAVE_PATH, engine="openpyxl") as writer:
+        new_df.to_excel(writer, index=False, sheet_name="Extended")
+        all_df.to_excel(writer, index=False, sheet_name="All")
+    print(f"💾 已保存到：{SAVE_PATH} (包含 Extended / All 两个sheet)")
