@@ -1,0 +1,698 @@
+# === 3D打印 | 四分区三目标优化（ABXYP五参数 + 纯文本进度条 + HVC_mean + 档案/混采/不覆盖xlsx + 新停止规则）===
+
+import os, json, math, random, re, sys, subprocess
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from glob import glob
+
+# 纯文本进度条（避免widget报错）
+try:
+    from tqdm import tqdm
+except Exception:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "tqdm"])
+    from tqdm import tqdm
+
+def prog(iterable, desc="", total=None):
+    """统一的纯文本进度条包装，确保不使用notebook小部件。"""
+    return tqdm(iterable, desc=desc, total=total, ncols=100, leave=False, mininterval=0.1, disable=False)
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, ConstantKernel, WhiteKernel
+from sklearn.exceptions import ConvergenceWarning
+import warnings
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+# ---------------- 配置（按需改） ----------------
+DATA_GPR = "GPR.xlsx"                 # 候选库
+DATA_RESULT = "result记录.xlsx"        # 历史评估记录（已有25组）
+OUT_DIR = Path("opt_state")           # 状态与中间结果
+FORM_DIR = Path("result记录")          # 待填写表格输出目录
+
+# 候选生成
+CANDIDATES_PER_ROUND = 5              # 每轮候选 q
+SAMPLE_SIZE = 3000                    # 标准模式：每轮采样（近邻+全局）
+LOCAL_RATIO = 0.6                     # 标准模式：近邻比例
+K_NEIGHBORS = 60                      # 标准模式：近邻池大小
+ANCHORS_K = 3                         # 历史最优锚点数
+
+# 纯局部开发（无改进时启用）
+EXPLOIT_LOCAL_RATIO = 1.0             # 纯局部
+EXPLOIT_SAMPLE_SIZE = 400             # 小样本快速迭代
+EXPLOIT_K_NEIGHBORS = 20              # 更紧的邻域
+
+# 预测支配过滤容差
+EPSILON = np.array([1e-6, 1e-6, 1e-6], dtype=float)
+
+# HVC_mean（基于预测均值的超体积贡献）
+HVC_POOL = 300                        # 进入贡献计算的候选数
+HV_SAMPLES_ARCH = 12000               # 档案HV蒙特卡洛样本（每轮一次）
+HV_SAMPLES_HVC  = 5000                # HVC用的均匀样本（每轮一次）
+
+# 新停止规则
+NO_IMPROVE_LIMIT = 3                 # 连续3轮无改进 → 停止
+PATIENCE_PRINT = 2                    # 仅用于提示（不强制）
+
+SEED = 42
+random.seed(SEED); np.random.seed(SEED)
+
+# 四分区 & 三目标（列名与你的表一致）
+ZONES = ["后跟", "前掌", "中足外", "足弓"]
+TARGETS = ["后跟应力", "中足角度", "前掌推进"]
+
+# ============ 工具函数 ============
+def ensure_dirs():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    FORM_DIR.mkdir(parents=True, exist_ok=True)
+
+def load_state():
+    p = OUT_DIR / "state.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    # 新增 no_improve_rounds & stopped
+    return {
+        "round": 1,
+        "merged_forms": [],
+        "best_hv": None,
+        "no_improve_rounds": 0,
+        "stopped": False
+    }
+
+def save_state(state):
+    (OUT_DIR / "state.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def load_gpr_dataset(path):
+    df = pd.read_excel(path)
+    # 预测只用 ABXYP，但导出表会用到其他列，所以也尽量保留
+    required_pred = ["N","A","B","X","Y","P"]
+    miss = [c for c in required_pred if c not in df.columns]
+    if miss:
+        raise ValueError(f"GPR.xlsx 缺少列（用于预测）：{miss}")
+    for c in df.columns:
+        if c != "N":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=required_pred).copy()
+    if df["N"].duplicated().any():
+        raise ValueError("GPR.xlsx 列 N 存在重复值，请保证唯一。")
+    return df.reset_index(drop=True)
+
+def load_result_history(path):
+    if not Path(path).exists():
+        raise FileNotFoundError(f"找不到 {path}（需要你的 25 组初始样本）")
+    df = pd.read_excel(path)
+    base_cols = ZONES + TARGETS
+    for i in range(1,5):
+        base_cols += [f"A{i}", f"B{i}", f"C{i}", f"X{i}", f"Y{i}", f"E(MPa){i}", f"V{i}", f"G(Mpa){i}"]
+    miss = [c for c in base_cols if c not in df.columns]
+    if miss:
+        raise ValueError(f"result记录.xlsx 缺少列：{miss}")
+    hist = df.dropna(subset=TARGETS).copy()
+    if hist.empty:
+        raise RuntimeError("历史记录中没有已填三指标的数据。需要你的25组初始样本（含三指标）。")
+    return df, hist
+
+def row_by_N(gpr_df, N):
+    rr = gpr_df.loc[gpr_df["N"] == N]
+    if rr.empty:
+        raise KeyError(f"GPR.xlsx 中未找到 N={N}")
+    return rr.iloc[0]
+
+# ========= 特征工程（只用 ABXYP）=========
+def combo_to_feature_from_Ns(gpr_df, Ns):
+    feat = []
+    for z in ZONES:
+        rr = row_by_N(gpr_df, Ns[z])
+        feat.extend([rr["A"], rr["B"], rr["X"], rr["Y"], rr["P"]])
+    return np.array(feat, dtype=float)
+
+def extract_XY_from_history(hist_df, gpr_df):
+    X, y1, y2, y3 = [], [], [], []
+    tried_keys = set()
+    for _, r in hist_df.iterrows():
+        Ns = { z: int(r[z]) for z in ZONES }
+        tried_keys.add(tuple(Ns[z] for z in ZONES))
+        X.append(combo_to_feature_from_Ns(gpr_df, Ns))
+        y1.append(float(r["后跟应力"]))
+        y2.append(float(r["中足角度"]))
+        y3.append(float(r["前掌推进"]))
+    X = np.array(X, dtype=float)
+    if np.isnan(X).any():
+        raise ValueError("训练特征X中发现NaN，请检查GPR.xlsx是否有缺失。")
+    return X, np.array(y1), np.array(y2), np.array(y3), tried_keys
+
+def train_gprs(X, y_dict):
+    scaler = StandardScaler().fit(X)
+    Xs = scaler.transform(X)
+    gprs = {}
+    kernel = ConstantKernel(1.0, (1e-3, 1e3)) * Matern(nu=2.5) + WhiteKernel(noise_level=1e-6)
+    for name, y in y_dict.items():
+        gpr = GaussianProcessRegressor(kernel=kernel, normalize_y=True, random_state=SEED, n_restarts_optimizer=2)
+        gpr.fit(Xs, y)
+        gprs[name] = gpr
+    return gprs, scaler
+
+# ========= 采样（近邻 + 全局）=========
+def min_max_norm(arr):
+    a = np.array(arr, dtype=float)
+    lo, hi = np.nanmin(a), np.nanmax(a)
+    return np.zeros_like(a) if math.isclose(hi, lo) else (a-lo)/(hi-lo)
+
+def pick_anchors(hist_df):
+    a = min_max_norm(hist_df["后跟应力"].to_numpy(float))
+    b = min_max_norm(hist_df["中足角度"].to_numpy(float))
+    c = min_max_norm(-hist_df["前掌推进"].to_numpy(float))
+    score = a + b + c
+    return hist_df.iloc[np.argsort(score)[:min(ANCHORS_K, len(hist_df))]]
+
+def nearest_Ns_pool(gpr_df, N0, k):
+    feat_all = gpr_df[["A","B","X","Y","P"]].to_numpy(float)
+    rr = row_by_N(gpr_df, int(N0))
+    v0 = rr[["A","B","X","Y","P"]].to_numpy(float)
+    d = np.linalg.norm(feat_all - v0, axis=1)
+    idx = np.argsort(d)[:min(k, len(d))]
+    return gpr_df.iloc[idx]["N"].astype(int).tolist()
+
+def sample_local(gpr_df, tried_keys, hist_df, k_local, k_neighbors):
+    anchors = pick_anchors(hist_df)
+    out, used = [], set()
+    if anchors.empty:
+        return out
+    pools_cache = {}
+    per_anchor = max(1, k_local // len(anchors))
+    for idx in prog(range(len(anchors)), desc="🏘️ 近邻采样(锚点)"):
+        arow = anchors.iloc[idx]
+        Ns_anchor = {z:int(arow[z]) for z in ZONES}
+        pools = {}
+        for z in ZONES:
+            key = (z, Ns_anchor[z], k_neighbors)
+            if key not in pools_cache:
+                pools_cache[key] = nearest_Ns_pool(gpr_df, Ns_anchor[z], k=k_neighbors)
+            pools[z] = pools_cache[key]
+        for _ in prog(range(per_anchor), desc=f"  ↳ 锚点{idx+1}采样"):
+            c = {z: random.choice(pools[z]) for z in ZONES}
+            key = tuple(c[z] for z in ZONES)
+            if key in tried_keys or key in used:
+                continue
+            out.append(c); used.add(key)
+    return out
+
+def sample_global(gpr_df, k, tried_keys):
+    N_list = gpr_df["N"].astype(int).tolist()
+    out, used = [], set()
+    for _ in prog(range(k), desc="🌍 全局采样"):
+        c = { z: random.choice(N_list) for z in ZONES }
+        key = tuple(c[z] for z in ZONES)
+        if key in tried_keys or key in used:
+            continue
+        out.append(c); used.add(key)
+    return out
+
+# ========= 档案/超体积（矢量化 + 样本复用）=========
+def build_archive(hist_df):
+    return hist_df[["后跟应力","中足角度","前掌推进"]].to_numpy(float)
+
+def ref_point(Y):
+    return np.array([Y[:,0].max()*1.05, Y[:,1].max()*1.05, Y[:,2].min()*0.95], dtype=float)
+
+def _prep_minimize(Y, ref):
+    P = np.stack([Y[:,0], Y[:,1], -Y[:,2]], axis=1)
+    R = np.array([ref[0], ref[1], -ref[2]], float)
+    return P, R
+
+def hv_mc_vec(Y, ref, U):
+    P, R = _prep_minimize(Y, ref)
+    lows = np.minimum(P.min(axis=0), 1e-12)
+    highs = R
+    box = highs - lows
+    Un = lows + U * box  # [S,3]
+    dominated = np.all(P[None, :, :] <= Un[:, None, :], axis=2).any(axis=1)
+    box_vol = float(np.prod(box))
+    return float(dominated.mean() * box_vol)
+
+def make_uniform_U(n_samples, seed):
+    rng = np.random.RandomState(seed)
+    return rng.uniform(0.0, 1.0, size=(n_samples, 3))
+
+def hvc_mean(mu, arch, ref, U_hvc):
+    """基于预测均值的超体积贡献：HV(arch ∪ {mu}) - HV(arch)"""
+    hv0 = hv_mc_vec(arch, ref, U_hvc)
+    mu_arr = np.asarray(mu, dtype=float)[None, :]      # ← 修复：tuple → ndarray (1,3)
+    hv1 = hv_mc_vec(np.vstack([arch, mu_arr]), ref, U_hvc)
+    return hv1 - hv0
+
+# ========= “预测支配过滤” ==========
+def dominated_by_archive(pred, arch, eps=EPSILON):
+    """
+    若 ∃a∈arch 使 a ≤ pred-ε 且 ∃维严格< ，则 pred 被历史档案支配（方向：小小大）。
+    实现：把第三维取负转成“全小化”再判断。
+    """
+    pa = np.array([pred[0], pred[1], -pred[2]], float)
+    A  = np.c_[arch[:,0], arch[:,1], -arch[:,2]]
+    le = (A <= (pa - eps)).all(axis=1)
+    lt = (A <  (pa - eps)).any(axis=1)
+    return bool(np.any(le & lt))
+
+# ========= 多目标兜底 ==========
+def nondominated_indices(points, sense=(+1,+1,-1)):
+    P = np.array(points, dtype=float)
+    P_adj = P.copy()
+    for j, s in enumerate(sense):
+        if s == -1:
+            P_adj[:, j] = -P_adj[:, j]
+    n = P_adj.shape[0]
+    is_nd = np.ones(n, dtype=bool)
+    for i in range(n):
+        if not is_nd[i]:
+            continue
+        for j in range(n):
+            if i == j or not is_nd[j]:
+                continue
+            if np.all(P_adj[j] <= P_adj[i]) and np.any(P_adj[j] < P_adj[i]):
+                is_nd[i] = False
+                break
+    return np.where(is_nd)[0]
+
+# ========= 表单/合并（不覆盖） ==========
+def list_round_forms(round_id):
+    patt = str(FORM_DIR / f"待填写_第{round_id}轮*.xlsx")
+    files = sorted(glob(patt))
+    return [Path(p) for p in files]
+
+def is_filled_form(path):
+    if not path.exists():
+        return False
+    df = pd.read_excel(path)
+    if not all(col in df.columns for col in TARGETS):
+        return False
+    return df[TARGETS].notna().all(axis=None)
+
+def append_filled_to_history(filled_path, history_path):
+    hist_all = pd.read_excel(history_path)
+    filled = pd.read_excel(filled_path)
+    filled = filled[hist_all.columns]
+    merged = pd.concat([hist_all, filled], ignore_index=True)
+    merged.to_excel(history_path, index=False)
+    return len(filled)
+
+def next_version_path(round_id):
+    existing = list_round_forms(round_id)
+    if not existing:
+        return FORM_DIR / f"待填写_第{round_id}轮_v001.xlsx"
+    max_v = 0
+    pat = re.compile(rf"待填写_第{round_id}轮_v(\d+)\.xlsx$")
+    for p in existing:
+        m = pat.search(p.name)
+        if m:
+            max_v = max(max_v, int(m.group(1)))
+    return FORM_DIR / f"待填写_第{round_id}轮_v{max_v+1:03d}.xlsx"
+
+def build_candidate_dataframe(gpr_df, combos, preds, round_id):
+    rows = []
+    for combo, yhat in zip(combos, preds):
+        row = {"迭代": round_id}
+        for z in ZONES:
+            row[z] = combo[z]
+        # 导出给FE的参数（预测只用ABXYP，这里仍给出常用列）
+        for i, z in enumerate(ZONES, 1):
+            rr = row_by_N(gpr_df, combo[z])
+            row[f"A{i}"] = float(rr.get("A", np.nan))
+            row[f"B{i}"] = float(rr.get("B", np.nan))
+            row[f"C{i}"] = float(rr.get("C", np.nan))
+            row[f"X{i}"] = float(rr.get("X", np.nan))
+            row[f"Y{i}"] = float(rr.get("Y", np.nan))
+            row[f"E(MPa){i}"] = float(rr.get("E(MPa)", np.nan))
+            row[f"V{i}"] = float(rr.get("V", np.nan))
+            row[f"G(Mpa){i}"] = float(rr.get("G(Mpa)", np.nan))
+        # 三指标空着（等你填）
+        row["后跟应力"] = np.nan; row["中足角度"] = np.nan; row["前掌推进"] = np.nan
+        # 代理预测（参考）
+        row["预测_后跟应力"] = float(yhat[0]); row["预测_中足角度"] = float(yhat[1]); row["预测_前掌推进"] = float(yhat[2])
+        rows.append(row)
+    cols = (["迭代"] + ZONES +
+            [f"{c}{i}" for i in range(1,5) for c in ["A","B","C","X","Y","E(MPa)","V","G(Mpa)"]] +
+            ["后跟应力","中足角度","前掌推进","预测_后跟应力","预测_中足角度","预测_前掌推进"])
+    return pd.DataFrame(rows)[cols]
+
+# ============ 主流程 ============
+def main():
+    ensure_dirs()
+    state = load_state()
+    round_id = state["round"]
+    merged_forms = set(state.get("merged_forms", []))
+    best_hv = state.get("best_hv", None)
+    no_improve_rounds = state.get("no_improve_rounds", 0)
+    stopped = state.get("stopped", False)
+
+    if stopped:
+        print("🛑 已达到停止条件（连续无改进达到上限）。不再生成新候选。")
+        return
+
+    print(f"🔎 当前轮：第 {round_id} 轮。扫描并合并已填写表…")
+    forms = list_round_forms(round_id)
+    merged_now = 0
+    for f in prog(forms, desc="  扫描表单"):
+        if f.name in merged_forms:
+            continue
+        if is_filled_form(f):
+            n = append_filled_to_history(f, DATA_RESULT)
+            merged_forms.add(f.name); merged_now += n
+            print(f"  ✅ 已合并：{f.name}（{n} 行）")
+
+    # 合并后更新档案HV/无改进计数，并切到下一轮或停止
+    if merged_now > 0:
+        result_all_df, hist_df = load_result_history(DATA_RESULT)
+        arch = build_archive(hist_df)
+        ref  = ref_point(arch)
+        print("  ⏳ 计算超体积(HV)…")
+        U_arch = make_uniform_U(HV_SAMPLES_ARCH, seed=SEED+round_id)  # 每轮一次
+        hv_now = hv_mc_vec(arch, ref, U_arch)
+
+        if (best_hv is None) or (hv_now > best_hv + 1e-12):
+            no_improve_rounds = 0
+            best_hv = hv_now
+            print(f"🎉 HV 改进：{hv_now:.6g} ；无改进计数归零。")
+        else:
+            no_improve_rounds += 1
+            print(f"⚠️ 本轮未改进：HV={hv_now:.6g}；连续无改进={no_improve_rounds}/{NO_IMPROVE_LIMIT}")
+
+        # 是否达到停止阈值？
+        if no_improve_rounds >= NO_IMPROVE_LIMIT:
+            state.update({
+                "round": round_id,  # 不再推进
+                "merged_forms": sorted(list(merged_forms)),
+                "best_hv": best_hv,
+                "no_improve_rounds": no_improve_rounds,
+                "stopped": True
+            })
+            save_state(state)
+            print("🛑 连续 10 轮无超体积提升；停止 RH 优化。")
+            return
+
+        # 进入下一轮
+        state.update({
+            "round": round_id + 1,
+            "merged_forms": sorted(list(merged_forms)),
+            "best_hv": best_hv,
+            "no_improve_rounds": no_improve_rounds,
+            "stopped": False
+        })
+        save_state(state)
+        round_id = state["round"]
+
+    # 如果进入 exploit-only 模式（至少 1 轮未改善）：只在最优附近取 5 组
+    exploit_only = no_improve_rounds >= 1
+    if exploit_only:
+        print(f"🟠 进入纯局部开发模式（已有 {no_improve_rounds} 轮未改进）：本轮 5 组将更靠近历史最优。")
+        cur_SAMPLE_SIZE   = EXPLOIT_SAMPLE_SIZE
+        cur_LOCAL_RATIO   = EXPLOIT_LOCAL_RATIO
+        cur_K_NEIGHBORS   = EXPLOIT_K_NEIGHBORS
+        cur_HVC_POOL      = min(HVC_POOL, 120)   # 小一点更快
+    else:
+        print(f"🚀 为第 {round_id} 轮生成候选…（标准模式）")
+        cur_SAMPLE_SIZE   = SAMPLE_SIZE
+        cur_LOCAL_RATIO   = LOCAL_RATIO
+        cur_K_NEIGHBORS   = K_NEIGHBORS
+        cur_HVC_POOL      = HVC_POOL
+
+    gpr_df = load_gpr_dataset(DATA_GPR)
+    result_all_df, hist_df = load_result_history(DATA_RESULT)
+
+    print("  ⏳ 训练GPR（ABXYP 20维）…")
+    X, y1, y2, y3, tried_keys = extract_XY_from_history(hist_df, gpr_df)
+    gprs, scaler = train_gprs(X, {"后跟应力":y1, "中足角度":y2, "前掌推进":y3})
+    print(f"  ✅ 代理已训练：样本数={len(X)}，维度={X.shape[1]}")
+
+    # 近邻+全局混采（exploit-only时，LOCAL_RATIO=1.0）
+    k_local = int(cur_SAMPLE_SIZE * cur_LOCAL_RATIO)
+    k_global = cur_SAMPLE_SIZE - k_local
+    print("  ⏳ 近邻采样…")
+    local_part  = sample_local(gpr_df, tried_keys, hist_df, k_local, k_neighbors=cur_K_NEIGHBORS)
+    print("  ⏳ 全局采样…")
+    global_part = sample_global(gpr_df, k_global, tried_keys)
+    combos = local_part + global_part
+    random.shuffle(combos)
+    print(f"  ✅ 采样完成：近邻={len(local_part)}，全局={len(global_part)}，合计={len(combos)}")
+
+    # 代理预测 & 预测支配过滤
+    arch = build_archive(hist_df)
+    ref  = ref_point(arch)
+    kept_combos, preds_mean = [], []
+    print("  ⏳ 代理预测 + 预测支配过滤…")
+    for c in prog(combos, desc="  预测过滤"):
+        x = combo_to_feature_from_Ns(gpr_df, c).reshape(1,-1)
+        xs = scaler.transform(x)
+        mu = (float(gprs["后跟应力"].predict(xs)[0]),
+              float(gprs["中足角度"].predict(xs)[0]),
+              float(gprs["前掌推进"].predict(xs)[0]))
+        if not dominated_by_archive(mu, arch, EPSILON):
+            kept_combos.append(c); preds_mean.append(mu)
+
+    # 过滤后若不足 q，自动放宽（不过滤）
+    if len(kept_combos) < CANDIDATES_PER_ROUND:
+        print("  ⚠️ 过滤后候选过少，放宽：使用未过滤候选。")
+        kept_combos, preds_mean = [], []
+        for c in prog(combos, desc="  重算预测"):
+            x = combo_to_feature_from_Ns(gpr_df, c).reshape(1,-1)
+            xs = scaler.transform(x)
+            mu = (float(gprs["后跟应力"].predict(xs)[0]),
+                  float(gprs["中足角度"].predict(xs)[0]),
+                  float(gprs["前掌推进"].predict(xs)[0]))
+            kept_combos.append(c); preds_mean.append(mu)
+
+    pm = np.array(preds_mean, float)
+
+    # 预筛（简单综合分）→ 进入 HVC_mean 候选池
+    if pm.shape[0] > 0:
+        a = min_max_norm(pm[:,0]); b = min_max_norm(pm[:,1]); c = min_max_norm(-pm[:,2])
+        J = a + b + c
+        pre_idx = np.argsort(J)[:min(cur_HVC_POOL, len(kept_combos))]
+    else:
+        pre_idx = np.array([], dtype=int)
+
+    pre_combos = [kept_combos[i] for i in pre_idx]
+    pre_means  = [preds_mean[i] for i in pre_idx]
+
+    # 一次性生成 HVC 用的样本（每轮复用）
+    U_hvc = make_uniform_U(HV_SAMPLES_HVC, seed=SEED+round_id*7+1)
+
+    # 计算 HVC_mean（越大越好）
+    print("  ⏳ 计算 HVC_mean（基于预测均值的超体积贡献）…")
+    hvc_scores = []
+    for mu in prog(pre_means, desc="  HVC候选"):
+        hvc = hvc_mean(mu, arch, ref, U_hvc)
+        hvc_scores.append(hvc)
+
+    # 选择 top-q（若 exploit-only，可认为是“5组接近最好”的参数，因为整个采样都在最优邻域）
+    if hvc_scores:
+        order = np.argsort(hvc_scores)[::-1]
+        chosen = [pre_combos[i] for i in order[:CANDIDATES_PER_ROUND]]
+        chosen_preds = [pre_means[i] for i in order[:CANDIDATES_PER_ROUND]]
+    else:
+        # 兜底：取预测帕累托 + 补足
+        nd_idx = nondominated_indices(pm, sense=(+1,+1,-1)) if len(kept_combos)>0 else []
+        nd_combos = [kept_combos[i] for i in nd_idx][:CANDIDATES_PER_ROUND]
+        chosen = nd_combos
+        chosen_preds = [preds_mean[i] for i in (nd_idx[:CANDIDATES_PER_ROUND] if len(nd_idx)>0 else [])]
+
+    # 导出当轮新表（不覆盖）
+    form_path = next_version_path(round_id)
+    form_df = build_candidate_dataframe(gpr_df, chosen, chosen_preds, round_id)
+    form_df.to_excel(form_path, index=False)
+
+    # 保存状态
+    state.update({
+        "merged_forms": sorted(list(merged_forms)),
+        "no_improve_rounds": no_improve_rounds,
+        "stopped": False
+    })
+    save_state(state)
+
+    print(f"📝 已生成候选文件：{form_path}")
+    if exploit_only:
+        print("👉 当前为纯局部开发模式：这 5 组均在历史最优附近。填写三指标并保存，运行本Cell将继续判断是否停止或继续。")
+    else:
+        print("👉 在该文件填写三指标后保存；下次运行本Cell会自动识别并合并。")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+# === One-cell: HV progression (iterations only, vlines per 5) + Stress–Prop scatter (legend outside) + 2-objective best picks ===
+import pandas as pd, numpy as np, math
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+from pathlib import Path
+
+# ---------------- Config ----------------
+DATA_RESULT = Path("result记录.xlsx")
+OUT_DIR = Path("figs"); OUT_DIR.mkdir(exist_ok=True)
+INITIAL_COUNT = 25
+TARGETS = ["后跟应力","中足角度","前掌推进"]
+COL_STRESS, COL_PROP, ROUND_COL = "后跟应力", "前掌推进", "迭代"
+
+# ---------------- HV utils ----------------
+def ref_point(Y):
+    # 小、小、大（第三维参考用最小*0.95）
+    return np.array([Y[:,0].max()*1.05, Y[:,1].max()*1.05, Y[:,2].min()*0.95], float)
+
+def _prep_minimize(Y, ref):
+    # 转成全小化：第三维取负
+    P = np.stack([Y[:,0], Y[:,1], -Y[:,2]], axis=1)
+    R = np.array([ref[0], ref[1], -ref[2]], float)
+    return P, R
+
+def hv_mc_vec(Y, ref, U):
+    if Y.size == 0: return 0.0
+    P, R = _prep_minimize(Y, ref)
+    lows, highs = np.minimum(P.min(axis=0), 1e-12), R
+    box = highs - lows
+    Un = lows + U * box
+    dominated = np.all(P[None,:,:] <= Un[:,None,:], axis=2).any(axis=1)
+    return float(dominated.mean() * float(np.prod(box)))
+
+def make_uniform_U(n=20000, seed=42):
+    rng = np.random.RandomState(seed)
+    return rng.uniform(0,1,size=(n,3))
+
+def minmax_norm(x, reverse=False):
+    x = np.asarray(x, float); lo, hi = np.nanmin(x), np.nanmax(x)
+    if math.isclose(lo,hi): return np.zeros_like(x)
+    y = (x - lo) / (hi - lo)
+    return 1.0 - y if reverse else y
+
+# ---------------- Load & split ----------------
+df_all = pd.read_excel(DATA_RESULT)
+df_all = df_all.dropna(subset=TARGETS).copy()
+
+if len(df_all) <= INITIAL_COUNT:
+    raise RuntimeError(f"数据不足（仅 {len(df_all)} 行），前 {INITIAL_COUNT} 行为初始样本。")
+
+df_init = df_all.iloc[:INITIAL_COUNT].copy().reset_index(drop=True)      # 初始25
+df_iter = df_all.iloc[INITIAL_COUNT:].copy().reset_index(drop=True)      # 迭代样本
+
+# ---------------- Compute HV per iteration (x轴仅迭代) ----------------
+U = make_uniform_U(20000, seed=20251019)
+Y_init = df_init[TARGETS].to_numpy(float)
+ref_init = ref_point(Y_init)
+hv_init = hv_mc_vec(Y_init, ref_init, U)
+
+Y_acc_iter, hv_series, hv_delta = [], [], []
+for i in range(len(df_iter)):
+    Y_acc_iter.append(df_iter.loc[i, TARGETS].to_numpy(float))
+    Y_now = np.vstack([Y_init, np.vstack(Y_acc_iter)])
+    ref   = ref_point(Y_now)
+    hv    = hv_mc_vec(Y_now, ref, U)
+    hv_series.append(hv)
+    hv_delta.append(hv - (hv_series[i-1] if i>0 else hv_init))
+
+df_iter["IterIndex"] = np.arange(1, len(df_iter)+1)
+df_iter["HV_cumulative"] = hv_series
+df_iter["HV_delta_from_prev"] = hv_delta
+
+# 轮次→颜色（蓝→红）
+rounds = pd.to_numeric(df_iter.get(ROUND_COL, pd.Series([np.nan]*len(df_iter))), errors="coerce")
+rounds = rounds.fillna(method="ffill").fillna(method="bfill").fillna(1)
+rmin, rmax = int(rounds.min()), int(rounds.max())
+norm = Normalize(vmin=rmin, vmax=rmax)
+cmap = plt.colormaps["coolwarm"]
+colors_iter = cmap(norm(rounds.to_numpy(float)))
+
+# ---------------- (A) HV progression（迭代样本；竖线每 5 个样本一条） ----------------
+fig, ax = plt.subplots(figsize=(9,6))
+ax.plot(df_iter["IterIndex"], df_iter["HV_cumulative"], color="lightgray", linewidth=1.0)
+ax.scatter(df_iter["IterIndex"], df_iter["HV_cumulative"], c=colors_iter, s=32, edgecolors="none")
+
+# 竖向辅助线：每 5 个迭代样本一条
+max_x = int(df_iter["IterIndex"].iloc[-1])
+for x in range(5, max_x+1, 5):
+    ax.axvline(x, color="gainsboro", linestyle="--", linewidth=0.8)
+
+sm = ScalarMappable(norm=norm, cmap=cmap)
+cbar = fig.colorbar(sm, ax=ax)
+cbar.set_label("Round (iterations 1–12)")
+ax.set_xlabel("Iterative sample index (initial 25 excluded)")
+ax.set_ylabel("Cumulative hypervolume (Monte Carlo)")
+ax.set_title("HV progression over iterative samples (1–12 only, blue→red by round)")
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+hv_path = OUT_DIR / "hv_progress_iter_combined.png"
+plt.savefig(hv_path, dpi=160)
+plt.show()
+
+# ---------------- (B) Heel stress vs Forefoot propulsion（图例放到图外底部） ----------------
+fig, ax = plt.subplots(figsize=(9,7))
+# 初始25 深蓝
+init_color = (0.10, 0.25, 0.70, 1.0)
+ax.scatter(df_init["后跟应力"], df_init["前掌推进"],
+           c=[init_color], s=36, edgecolors="none", alpha=0.95, label="Initial 25 (fixed blue)")
+# 迭代 蓝→红
+ax.scatter(df_iter["后跟应力"], df_iter["前掌推进"],
+           c=colors_iter, s=36, edgecolors="none", alpha=0.95, label="Iterations (1→12)")
+
+sm2 = ScalarMappable(norm=norm, cmap=cmap)
+cbar2 = fig.colorbar(sm2, ax=ax)
+cbar2.set_label("Round (iterations 1–12)")
+ax.set_xlabel("Heel stress (↓)")
+ax.set_ylabel("Forefoot propulsion (↑)")
+ax.set_title("Heel stress vs Forefoot propulsion\nInitial=dark blue, Iterations colored by round (blue→red)")
+ax.grid(True, alpha=0.3)
+
+# 图例移到图外底部（不遮挡），两列排版
+leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2, frameon=False)
+plt.tight_layout()
+plt.subplots_adjust(bottom=0.18)  # 给底部图例留出空间
+sc_path = OUT_DIR / "stress_vs_prop_iter_combined.png"
+plt.savefig(sc_path, dpi=160)
+plt.show()
+
+# ---------------- (C) 2-objective best picks (忽略中足角度) ----------------
+df_all2 = pd.concat([df_init, df_iter], ignore_index=True)
+s_norm = minmax_norm(df_all2["后跟应力"].values, reverse=False)
+p_norm = minmax_norm(df_all2["前掌推进"].values, reverse=True)
+dist = np.sqrt(s_norm**2 + p_norm**2)
+
+idx_utopia      = int(np.argmin(dist))
+idx_min_stress  = int(np.argmin(df_all2["后跟应力"]))
+idx_max_prop    = int(np.argmax(df_all2["前掌推进"]))
+lowstress_thr   = np.nanpercentile(df_all2["后跟应力"], 25)
+subset_lowS     = df_all2[df_all2["后跟应力"] <= lowstress_thr]
+idx_maxprop_lowS = subset_lowS.index[np.argmax(subset_lowS["前掌推进"])] if not subset_lowS.empty else idx_max_prop
+
+def combo_info(df, idx, label):
+    r = df.iloc[idx]
+    return {
+        "Label": label,
+        "Round": int(r.get("迭代", np.nan)) if not pd.isna(r.get("迭代", np.nan)) else 0,
+        "Zones": {z:int(r[z]) for z in ["后跟","前掌","中足外","足弓"] if z in r and pd.notna(r[z])},
+        "Heel stress": float(r["后跟应力"]),
+        "Forefoot propulsion": float(r["前掌推进"]),
+    }
+
+recs = [
+    combo_info(df_all2, idx_utopia, "Utopia-closest (balanced)"),
+    combo_info(df_all2, idx_min_stress, "Min-Stress only"),
+    combo_info(df_all2, idx_max_prop, "Max-Propulsion only"),
+    combo_info(df_all2, idx_maxprop_lowS, "Max-Prop@lowStress (≤25th pct)")
+]
+
+print("\n=== Recommended best combinations (2-objective: stress↓, propulsion↑) ===")
+for r in recs:
+    print(f"\n[{r['Label']}]")
+    print({k:v for k,v in r.items() if k!='Label'})
+
+# ---------------- Summary ----------------
+final_hv = float(df_iter["HV_cumulative"].iloc[-1])
+best_step = int(df_iter["HV_delta_from_prev"].idxmax())
+print("\n=== Summary ===")
+print(f"Initial HV (25-sample baseline): {hv_init:.6g}")
+print(f"Final HV (after {len(df_iter)} iterations): {final_hv:.6g}")
+print(f"Largest single-step HV gain: Δ={df_iter['HV_delta_from_prev'].max():.6g} "
+      f"at IterIndex={df_iter.loc[best_step, 'IterIndex']} (Round={int(rounds.iloc[best_step])})")
+
+print(f"\n[Saved] {hv_path}")
+print(f"[Saved] {sc_path}")
